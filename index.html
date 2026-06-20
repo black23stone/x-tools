@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Arsip — X Personal Archive Reader</title>
+<meta name="description" content="Baca dan analisis data export X (Twitter) kamu sendiri, langsung di browser. Tidak ada data yang dikirim ke server." />
+
+<!-- Tailwind via CDN (no build step needed) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React + ReactDOM -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<!-- Babel standalone so we can write JSX directly in the browser -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  .font-serif { font-family: 'Source Serif 4', Georgia, serif; }
+  .font-mono { font-family: 'JetBrains Mono', monospace; }
+  body { font-family: 'JetBrains Mono', monospace; margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useCallback } = React;
+
+// ---------- Parsing helpers ----------
+// X's archive .js files look like: window.YTD.following.part0 = [ {...}, {...} ]
+function stripJsAssignment(text) {
+  const eq = text.indexOf("=");
+  if (eq === -1) return text.trim();
+  return text.slice(eq + 1).trim();
+}
+
+function tryParseArchiveFile(text) {
+  try {
+    const stripped = stripJsAssignment(text);
+    return JSON.parse(stripped);
+  } catch (e) {
+    try {
+      return JSON.parse(text);
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+function extractFollowingIds(json) {
+  if (!json) return [];
+  return json.map((row) => row.following && row.following.accountId).filter(Boolean);
+}
+
+function extractFollowerIds(json) {
+  if (!json) return [];
+  return json.map((row) => row.follower && row.follower.accountId).filter(Boolean);
+}
+
+function extractTweets(json) {
+  if (!json) return [];
+  return json.map((row) => row.tweet).filter(Boolean);
+}
+
+function extractLikes(json) {
+  if (!json) return [];
+  return json.map((row) => row.like).filter(Boolean);
+}
+
+const STOPWORDS = new Set([
+  "the","a","an","and","or","but","is","are","was","were","be","been","to","of","in","on","at","for","with",
+  "this","that","it","as","by","from","up","about","into","over","after","yang","di","ke","dari","dan","ini",
+  "itu","ya","ga","gak","aja","juga","kalo","kalau","kamu","saya","gw","gua","lo","loe","nya","si","ada",
+  "akan","udah","sudah","https","http","co","rt","amp","t.co"
+]);
+
+function tokenizeTweets(tweets) {
+  const freq = {};
+  tweets.forEach((t) => {
+    const text = (t.full_text || t.text || "").toLowerCase();
+    const words = text.match(/#?[a-zA-Z0-9_]{3,}/g) || [];
+    words.forEach((w) => {
+      const clean = w.replace(/^#/, "");
+      if (STOPWORDS.has(clean)) return;
+      if (/^\d+$/.test(clean)) return;
+      const key = w.startsWith("#") ? w : clean;
+      freq[key] = (freq[key] || 0) + 1;
+    });
+  });
+  return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 20);
+}
+
+function tweetsByMonth(tweets) {
+  const counts = {};
+  tweets.forEach((t) => {
+    const d = new Date(t.created_at);
+    if (isNaN(d)) return;
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  return Object.entries(counts).sort(([a], [b]) => (a > b ? 1 : -1));
+}
+
+function tweetsByHour(tweets) {
+  const counts = new Array(24).fill(0);
+  tweets.forEach((t) => {
+    const d = new Date(t.created_at);
+    if (isNaN(d)) return;
+    counts[d.getHours()]++;
+  });
+  return counts;
+}
+
+function topTweets(tweets, n = 5) {
+  return [...tweets].sort((a, b) => {
+    const sa = (parseInt(a.favorite_count) || 0) + (parseInt(a.retweet_count) || 0);
+    const sb = (parseInt(b.favorite_count) || 0) + (parseInt(b.retweet_count) || 0);
+    return sb - sa;
+  }).slice(0, n);
+}
+
+// ---------- File upload slot ----------
+const FILE_SLOTS = [
+  { key: "following", label: "following.js", hint: "Akun yang lo follow" },
+  { key: "follower", label: "follower.js", hint: "Akun yang follow lo" },
+  { key: "tweet", label: "tweet.js", hint: "Riwayat tweet lo" },
+  { key: "like", label: "like.js", hint: "Tweet yang pernah lo like" },
+];
+
+function FileSlot({ slot, status, onFile }) {
+  const inputId = `file-${slot.key}`;
+  return (
+    <label
+      htmlFor={inputId}
+      className={`group relative flex items-center gap-3 rounded-none border px-4 py-3 cursor-pointer transition-colors ${status === "loaded" ? "border-[#3a5a40] bg-[#3a5a40]/5" : "border-[#d8d2c4] hover:border-[#8a8270] bg-transparent"}`}
+    >
+      <input
+        id={inputId}
+        type="file"
+        accept=".js,.json,text/plain,application/json"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0];
+          if (f) onFile(slot.key, f);
+        }}
+      />
+      <span className={`flex h-6 w-6 shrink-0 items-center justify-center font-mono text-[11px] border ${status === "loaded" ? "border-[#3a5a40] text-[#3a5a40]" : "border-[#bdb6a4] text-[#8a8270]"}`}>
+        {status === "loaded" ? "✓" : "—"}
+      </span>
+      <span className="flex-1 min-w-0">
+        <span className="block font-mono text-[13px] tracking-tight text-[#2b2820]">{slot.label}</span>
+        <span className="block text-[11px] text-[#8a8270]">{slot.hint}</span>
+      </span>
+      <span className="text-[11px] font-mono text-[#8a8270] group-hover:text-[#2b2820] transition-colors">
+        {status === "loaded" ? "ganti" : "pilih"}
+      </span>
+    </label>
+  );
+}
+
+function Section({ index, title, subtitle, children, empty }) {
+  return (
+    <section className="border-t border-[#d8d2c4] pt-8 pb-2">
+      <div className="flex items-baseline gap-4 mb-6">
+        <span className="font-mono text-[11px] text-[#8a8270] tabular-nums">{index}</span>
+        <div>
+          <h2 className="font-serif text-[22px] leading-tight text-[#2b2820]">{title}</h2>
+          {subtitle && <p className="text-[13px] text-[#8a8270] mt-1">{subtitle}</p>}
+        </div>
+      </div>
+      {empty ? (
+        <div className="border border-dashed border-[#d8d2c4] px-5 py-6 text-[13px] text-[#8a8270]">{empty}</div>
+      ) : children}
+    </section>
+  );
+}
+
+function Stat({ value, label }) {
+  return (
+    <div className="border border-[#d8d2c4] px-4 py-4">
+      <div className="font-serif text-[28px] leading-none text-[#2b2820] tabular-nums">{value}</div>
+      <div className="text-[11px] text-[#8a8270] mt-1.5 uppercase tracking-wide">{label}</div>
+    </div>
+  );
+}
+
+function Bar({ label, value, max, accent = "#9c6b3f" }) {
+  const pct = max > 0 ? Math.max(2, (value / max) * 100) : 0;
+  return (
+    <div className="flex items-center gap-3 text-[12px]">
+      <span className="w-20 shrink-0 font-mono text-[#8a8270] truncate" title={label}>{label}</span>
+      <div className="flex-1 h-4 bg-[#ece7da] relative">
+        <div className="h-full" style={{ width: `${pct}%`, backgroundColor: accent }} />
+      </div>
+      <span className="w-8 text-right font-mono text-[#2b2820] tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+function App() {
+  const [files, setFiles] = useState({});
+  const [status, setStatus] = useState({});
+
+  const handleFile = useCallback((key, file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target.result;
+      const parsed = tryParseArchiveFile(text);
+      if (parsed) {
+        setFiles((prev) => ({ ...prev, [key]: parsed }));
+        setStatus((prev) => ({ ...prev, [key]: "loaded" }));
+      } else {
+        setStatus((prev) => ({ ...prev, [key]: "error" }));
+      }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  const followingIds = useMemo(() => extractFollowingIds(files.following), [files.following]);
+  const followerIds = useMemo(() => extractFollowerIds(files.follower), [files.follower]);
+  const tweets = useMemo(() => extractTweets(files.tweet), [files.tweet]);
+  const likes = useMemo(() => extractLikes(files.like), [files.like]);
+
+  const followAnalysis = useMemo(() => {
+    if (!files.following && !files.follower) return null;
+    const followingSet = new Set(followingIds);
+    const followerSet = new Set(followerIds);
+    const notFollowback = followingIds.filter((id) => !followerSet.has(id));
+    const fans = followerIds.filter((id) => !followingSet.has(id));
+    const mutual = followingIds.filter((id) => followerSet.has(id));
+    return { notFollowback, fans, mutual, followingCount: followingIds.length, followerCount: followerIds.length };
+  }, [followingIds, followerIds, files.following, files.follower]);
+
+  const tweetAnalysis = useMemo(() => {
+    if (!files.tweet) return null;
+    return {
+      total: tweets.length,
+      byMonth: tweetsByMonth(tweets),
+      byHour: tweetsByHour(tweets),
+      words: tokenizeTweets(tweets),
+      top: topTweets(tweets),
+    };
+  }, [tweets, files.tweet]);
+
+  const likeAnalysis = useMemo(() => {
+    if (!files.like) return null;
+    return {
+      total: likes.length,
+      words: tokenizeTweets(likes.map((l) => ({ full_text: l.fullText || "" }))),
+    };
+  }, [likes, files.like]);
+
+  const hasAnyFile = Object.keys(status).some((k) => status[k] === "loaded");
+  const maxHourCount = tweetAnalysis ? Math.max(...tweetAnalysis.byHour, 1) : 1;
+  const maxMonthCount = tweetAnalysis ? Math.max(...tweetAnalysis.byMonth.map(([, c]) => c), 1) : 1;
+  const peakHour = tweetAnalysis
+    ? tweetAnalysis.byHour.reduce((best, c, h) => (c > tweetAnalysis.byHour[best] ? h : best), 0)
+    : null;
+
+  return (
+    <div className="min-h-screen bg-[#f4f1e8] text-[#2b2820]">
+      <header className="border-b border-[#2b2820] px-5 sm:px-10 py-6">
+        <div className="max-w-3xl mx-auto">
+          <div className="flex items-center justify-between mb-1">
+            <span className="font-mono text-[11px] tracking-[0.15em] text-[#8a8270] uppercase">Arsip · Personal Archive Reader</span>
+            <span className="font-mono text-[11px] text-[#8a8270]">v1.0</span>
+          </div>
+          <h1 className="font-serif text-[34px] sm:text-[42px] leading-[1.05] mt-2">
+            Buka kotak arsip<br />akun X lo sendiri.
+          </h1>
+          <p className="text-[13px] text-[#5c5648] mt-3 max-w-lg leading-relaxed">
+            Upload file dari data export X lo. Semua diproses langsung di browser ini — nggak ada yang dikirim ke server manapun, nggak butuh login, nggak butuh API key.
+          </p>
+        </div>
+      </header>
+
+      <main className="max-w-3xl mx-auto px-5 sm:px-10 py-10 space-y-2">
+        <div className="border border-[#2b2820] px-5 py-4 mb-8 bg-[#fffdf7]">
+          <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-2">Cara ambil data</p>
+          <ol className="text-[13px] leading-relaxed space-y-1 list-none">
+            <li><span className="font-mono text-[#9c6b3f] mr-2">01</span>X → Settings → Your Account → Download an archive of your data</li>
+            <li><span className="font-mono text-[#9c6b3f] mr-2">02</span>Tunggu email dari X (bisa beberapa jam–hari)</li>
+            <li><span className="font-mono text-[#9c6b3f] mr-2">03</span>Extract zip-nya, masuk ke folder <code className="font-mono bg-[#ece7da] px-1">data/</code></li>
+            <li><span className="font-mono text-[#9c6b3f] mr-2">04</span>Upload file di bawah ini (boleh sebagian aja)</li>
+          </ol>
+        </div>
+
+        <div className="grid sm:grid-cols-2 gap-3 mb-4">
+          {FILE_SLOTS.map((slot) => (
+            <FileSlot key={slot.key} slot={slot} status={status[slot.key]} onFile={handleFile} />
+          ))}
+        </div>
+        {Object.values(status).includes("error") && (
+          <p className="text-[12px] text-[#a83232] font-mono mb-4">
+            Ada file yang gagal dibaca — pastikan itu file asli dari archive X (.js), bukan yang sudah diedit.
+          </p>
+        )}
+
+        {!hasAnyFile && (
+          <div className="border border-dashed border-[#d8d2c4] px-5 py-10 text-center mt-6">
+            <p className="font-serif text-[18px] text-[#5c5648]">Belum ada data ter-upload.</p>
+            <p className="text-[12px] text-[#8a8270] mt-1">Upload minimal satu file untuk mulai lihat analisis.</p>
+          </div>
+        )}
+
+        {hasAnyFile && (
+          <Section
+            index="01"
+            title="Follow & Followback"
+            subtitle="Berdasarkan following.js dan follower.js"
+            empty={!followAnalysis ? "Upload following.js dan/atau follower.js untuk lihat bagian ini." : null}
+          >
+            {followAnalysis && (
+              <React.Fragment>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                  <Stat value={followAnalysis.followingCount} label="Following" />
+                  <Stat value={followAnalysis.followerCount} label="Followers" />
+                  <Stat value={followAnalysis.mutual.length} label="Mutual" />
+                  <Stat value={followAnalysis.notFollowback.length} label="Not followback" />
+                </div>
+                {followAnalysis.followingCount > 0 && followAnalysis.followerCount > 0 && (
+                  <p className="text-[13px] text-[#5c5648] leading-relaxed">
+                    Dari <span className="font-mono">{followAnalysis.followingCount}</span> akun yang lo follow,{" "}
+                    <span className="font-mono text-[#9c6b3f]">{followAnalysis.notFollowback.length}</span> di antaranya belum follback. Lo punya{" "}
+                    <span className="font-mono text-[#3a5a40]">{followAnalysis.fans.length}</span> fans (follow lo tapi belum lo follback).
+                  </p>
+                )}
+                <p className="text-[11px] text-[#8a8270] mt-3 font-mono">
+                  Catatan: account ID di sini cuma angka — archive X nggak menyertakan username/nama langsung, jadi list nama detail nggak bisa ditampilkan tanpa lookup tambahan.
+                </p>
+              </React.Fragment>
+            )}
+          </Section>
+        )}
+
+        <Section
+          index="02"
+          title="Aktivitas Tweet"
+          subtitle="Berdasarkan tweet.js"
+          empty={!tweetAnalysis ? "Upload tweet.js untuk lihat bagian ini." : null}
+        >
+          {tweetAnalysis && (
+            <div className="space-y-8">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <Stat value={tweetAnalysis.total.toLocaleString()} label="Total tweet" />
+                <Stat value={peakHour !== null ? `${String(peakHour).padStart(2, "0")}:00` : "—"} label="Jam paling aktif" />
+                <Stat value={tweetAnalysis.byMonth.length} label="Bulan aktif" />
+              </div>
+
+              <div>
+                <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-3">Sebaran jam tweet (0–23)</p>
+                <div className="space-y-1.5">
+                  {tweetAnalysis.byHour.map((c, h) => (
+                    <Bar key={h} label={`${String(h).padStart(2, "0")}:00`} value={c} max={maxHourCount} />
+                  ))}
+                </div>
+              </div>
+
+              {tweetAnalysis.byMonth.length > 0 && (
+                <div>
+                  <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-3">
+                    Per bulan ({tweetAnalysis.byMonth.length} bulan terakhir ditampilkan)
+                  </p>
+                  <div className="space-y-1.5">
+                    {tweetAnalysis.byMonth.slice(-12).map(([m, c]) => (
+                      <Bar key={m} label={m} value={c} max={maxMonthCount} accent="#3a5a40" />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {tweetAnalysis.words.length > 0 && (
+                <div>
+                  <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-3">Kata/hashtag paling sering</p>
+                  <div className="flex flex-wrap gap-2">
+                    {tweetAnalysis.words.map(([w, c]) => (
+                      <span key={w} className="font-mono text-[12px] border border-[#d8d2c4] px-2 py-1 bg-[#fffdf7]">
+                        {w} <span className="text-[#9c6b3f]">{c}</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {tweetAnalysis.top.length > 0 && (
+                <div>
+                  <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-3">Top tweet (like + retweet)</p>
+                  <div className="space-y-2">
+                    {tweetAnalysis.top.map((t, i) => (
+                      <div key={i} className="border border-[#d8d2c4] px-4 py-3 bg-[#fffdf7]">
+                        <p className="text-[13px] leading-relaxed text-[#2b2820]">{t.full_text || t.text}</p>
+                        <p className="font-mono text-[11px] text-[#8a8270] mt-2">
+                          ♥ {t.favorite_count || 0} · ↻ {t.retweet_count || 0} · {new Date(t.created_at).toLocaleDateString("id-ID")}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </Section>
+
+        <Section
+          index="03"
+          title="Selera Like"
+          subtitle="Berdasarkan like.js"
+          empty={!likeAnalysis ? "Upload like.js untuk lihat bagian ini." : null}
+        >
+          {likeAnalysis && (
+            <div className="space-y-6">
+              <Stat value={likeAnalysis.total.toLocaleString()} label="Total like" />
+              {likeAnalysis.words.length > 0 && (
+                <div>
+                  <p className="font-mono text-[11px] uppercase tracking-wide text-[#8a8270] mb-3">Topik favorit (dari teks yang di-like)</p>
+                  <div className="flex flex-wrap gap-2">
+                    {likeAnalysis.words.map(([w, c]) => (
+                      <span key={w} className="font-mono text-[12px] border border-[#d8d2c4] px-2 py-1 bg-[#fffdf7]">
+                        {w} <span className="text-[#9c6b3f]">{c}</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </Section>
+
+        <footer className="border-t border-[#2b2820] mt-12 pt-6 pb-10">
+          <p className="font-mono text-[11px] text-[#8a8270] leading-relaxed">
+            Semua parsing terjadi di memori browser (JavaScript), tidak ada network request. Refresh halaman ini = semua data hilang. Tidak ada yang disimpan.
+          </p>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
