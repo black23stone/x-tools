@@ -21,12 +21,31 @@
   .font-serif { font-family: 'Source Serif 4', Georgia, serif; }
   .font-mono { font-family: 'JetBrains Mono', monospace; }
   body { font-family: 'JetBrains Mono', monospace; margin: 0; }
+  #error-box { display:none; position:fixed; inset:0; background:#fff; color:#a83232; padding:20px; font-family: monospace; font-size:13px; white-space:pre-wrap; overflow:auto; z-index:9999; line-height:1.5; }
+  #loading-msg { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:#8a8270; font-family: monospace; font-size:13px; }
 </style>
 </head>
 <body>
+<div id="loading-msg">memuat…</div>
+<div id="error-box"></div>
 <div id="root"></div>
+<script>
+  window.onerror = function(msg, url, line, col, error) {
+    var box = document.getElementById('error-box');
+    box.style.display = 'block';
+    box.textContent = 'ERROR DITEMUKAN:\n\n' + msg + '\n\nFile: ' + url + '\nBaris: ' + line + ', Kolom: ' + col + (error && error.stack ? '\n\nStack:\n' + error.stack : '');
+    document.getElementById('loading-msg').style.display = 'none';
+    return false;
+  };
+</script>
 
 <script type="text/babel" data-presets="react">
+if (typeof React === "undefined" || typeof ReactDOM === "undefined") {
+  document.getElementById("error-box").style.display = "block";
+  document.getElementById("error-box").textContent = "React gagal dimuat dari CDN (unpkg.com). Ini biasanya karena koneksi internet diblokir/lambat, atau ada adblocker yang memblokir unpkg.com. Coba: 1) cek koneksi internet, 2) matikan adblocker/VPN, 3) coba buka pakai jaringan lain.";
+  document.getElementById("loading-msg").style.display = "none";
+}
+
 const { useState, useMemo, useCallback } = React;
 
 // ---------- Parsing helpers ----------
@@ -439,7 +458,14 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+try {
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  document.getElementById("loading-msg").style.display = "none";
+} catch (err) {
+  document.getElementById("error-box").style.display = "block";
+  document.getElementById("error-box").textContent = "ERROR SAAT RENDER:\n\n" + err.message + "\n\n" + (err.stack || "");
+  document.getElementById("loading-msg").style.display = "none";
+}
 </script>
 </body>
 </html>
